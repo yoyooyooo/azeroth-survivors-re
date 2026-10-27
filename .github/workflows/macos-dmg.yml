@@ -86,9 +86,13 @@ jobs:
         run: |
           set -euo pipefail
           bin=target/release/warcraft-survivors
-          short="$(git rev-parse --short HEAD)"
-          if ! strings -a "$bin" | grep -Fq "$short"; then
-            echo "::error::$bin carries no build stamp (expected $short)"
+          # The full sha, not `strings | grep -q`. `grep -q` closes the pipe at the first hit and
+          # `strings` then dies flushing a hundreds-of-megabytes binary; under `pipefail` that
+          # death is the pipeline's status, so a binary that does carry the stamp still fails.
+          # `grep -a` reads the binary itself and exits on the match.
+          full="$(git rev-parse HEAD)"
+          if ! grep -a -F -q "$full" "$bin"; then
+            echo "::error::$bin carries no build stamp (expected $full)"
             exit 1
           fi
           file "$bin"
