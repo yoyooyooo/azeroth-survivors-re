@@ -1,0 +1,197 @@
+# The macOS build: a player build of the survivors mode, wrapped in `Azeroth Survivors.app` and
+# packed into a `.dmg` by `packaging/macos/bundle.sh`, attached to a GitHub release.
+#
+# Nothing else here produces a distributable: `check.yml` checks the wasm target on Linux,
+# `ci.yml` runs the gates on a fork's pull request, and `make native` builds for whatever machine
+# runs it. This is the only job that ships a binary to players, so it builds the *player* profile
+# (`--no-default-features`: no debug panel, perf HUD, inspector, capture harness or probes) on
+# Apple Silicon, the architecture of every Mac that runs the game.
+#
+# It runs when `main` moves, and by hand. A pull request never starts it: a cold Bevy release
+# build is most of an hour of runner time and none of it is a gate. Every successful run of `main`
+# publishes the dmg on the rolling `macos` release, so a player always downloads the current
+# build. A manual run uploads the dmg as a workflow artifact; give it a `tag` and it also publishes
+# a versioned release under that tag.
+#
+# The dmg is ad-hoc signed, not notarized (notarization needs a paid Apple Developer account): it
+# opens on both architectures, and Gatekeeper asks the player to confirm the first launch once.
+# `packaging/macos/bundle.sh` says where a Developer ID would go.
+name: macos-dmg
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Also publish a versioned release under this tag (e.g. v0.2.0); empty: artifact only, the rolling macos release is untouched"
+        required: false
+        default: ""
+concurrency:
+  group: macos-dmg-${{ github.ref }}
+  # A newer push of main supersedes a build that has not finished: the rolling release should be
+  # the current head, not whichever run happened to link last. A manual publish is its own ref, so
+  # it is never cancelled by a main push.
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  dmg:
+    # Apple Silicon. An Intel dmg is a second matrix entry (`macos-15-intel`), which doubles the
+    # build time for the Macs that are on their way out; add one when a player asks.
+    runs-on: macos-15
+    # A cold release build of the Bevy workspace is ~1 h on a 3-core runner; the ceiling is for a
+    # hung link, not for the build.
+    timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `git describe --tags --long` stamps the build id (`benilla-buildstamp`); a shallow
+          # clone has no tags and the app would report an unknown commit.
+          fetch-depth: 0
+
+      # A standard macOS runner has ~14 GB of disk, and a Bevy release build plus the image it is
+      # packed into is most of it. The unused Xcode versions are the one large thing here that no
+      # step needs; the selected one is never touched.
+      - name: free disk space
+        run: |
+          df -h /
+          selected="$(xcode-select -p)"
+          for app in /Applications/Xcode*.app; do
+            case "$selected" in "$app"/*) continue ;; esac
+            sudo rm -rf "$app"
+          done
+          df -h /
+
+      # rust-toolchain.toml pins the channel and its components, so the pin stays in one file
+      # instead of being repeated here.
+      - name: toolchain (rust-toolchain.toml)
+        run: rustup show && rustc -V
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-dmg
+
+      # The player build: `dev` off, so the instruments are compiled out
+      # (`crates/benilla-app/src/dev.rs`). `--locked` refuses a manifest that drifted from
+      # Cargo.lock, which would make the released binary not the one this repo pins.
+      - name: build (player profile)
+        run: cargo build --release --locked -p warcraft-survivors --no-default-features
+
+      # The build stamp is what a bug report quotes: `git describe --tags --long` needs the tags
+      # (`fetch-depth: 0` above) and a checkout that has not been rewritten.
+      - name: the binary carries its build stamp
+        run: |
+          set -euo pipefail
+          bin=target/release/warcraft-survivors
+          short="$(git rev-parse --short HEAD)"
+          if ! strings -a "$bin" | grep -Fq "$short"; then
+            echo "::error::$bin carries no build stamp (expected $short)"
+            exit 1
+          fi
+          file "$bin"
+
+      - name: version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          # A tag that names a version is the release's version; the manifest's is the fallback.
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            case "${GITHUB_REF_NAME}" in
+              v*) version="${GITHUB_REF_NAME#v}" ;;
+            esac
+          fi
+          describe="$(git describe --tags --long --always --dirty 2>/dev/null || true)"
+          # macOS orders builds by `CFBundleVersion`, which has to be dotted integers: the run
+          # number is the monotonic part, and it survives a re-run of the same tag unchanged.
+          {
+            echo "version=$version"
+            echo "build_number=${version}.${GITHUB_RUN_NUMBER}"
+            echo "describe=$describe"
+          } >> "$GITHUB_OUTPUT"
+          echo "building $version (${describe:-no tags in reach})"
+
+      - name: bundle the app and the dmg
+        run: |
+          packaging/macos/bundle.sh \
+            --bin target/release/warcraft-survivors \
+            --out dist \
+            --version "${{ steps.version.outputs.version }}" \
+            --build-number "${{ steps.version.outputs.build_number }}" \
+            --build-id "${{ steps.version.outputs.describe }}"
+
+      - name: checksum
+        run: |
+          cd dist
+          shasum -a 256 *.dmg > "Azeroth Survivors.dmg.sha256"
+          cat "Azeroth Survivors.dmg.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: azeroth-survivors-macos-arm64
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      # `main` republishes the rolling `macos` release on every successful build. The tag is not
+      # named `latest`: that word is also the flag GitHub uses for "the release the download
+      # button points at", and a tag of the same name makes `gh` refuse one or the other. A manual
+      # run publishes a versioned release only when it names a tag, so a test run cannot overwrite
+      # a release by accident, and it never touches `macos`.
+      - name: publish the release
+        if: github.ref == 'refs/heads/main' || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref == 'refs/heads/main' && 'macos' || inputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DESCRIBE: ${{ steps.version.outputs.describe }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'NOTES'
+          **Azeroth Survivors** — a free fan-made WoW roguelike by
+          [Aethus](https://wow.aethus.pl/), running on a from-scratch WoW 1.12.1 client engine
+          (Rust + Bevy). No server, no login, no account.
+
+          ### macOS (Apple Silicon)
+
+          Download the `.dmg`, open it, drag **Azeroth Survivors.app** onto Applications.
+
+          **The app ships no Blizzard content.** It reads a World of Warcraft 1.12.1 (build 5875)
+          client's `Data` folder, which you supply: put the client's `*.MPQ` files in
+          `~/Library/Application Support/Azeroth Survivors/Data/` (create the folder if it is not
+          there), or in a `Data` folder beside the app for a portable copy. Settings, macros and
+          screenshots live in that Application Support folder too. The dmg's own `README.txt` says
+          the same.
+
+          **First launch:** this build is ad-hoc signed and not notarized, so macOS asks once —
+          System Settings → Privacy & Security → *Open Anyway*.
+
+          **Check the download:**
+          `shasum -a 256 -c "Azeroth Survivors.dmg.sha256"`.
+
+          The build id is in the app's startup log (`benilla build <version> · <sha> · <date>`,
+          also in `Info.plist` as `AZBuildId`), which is what to quote in a bug report.
+          NOTES
+          printf '\nBuild: `%s`\nCommit: `%s`\n' "${DESCRIBE:-unknown}" "$SHA" >> notes.md
+          title="Azeroth Survivors $VERSION"
+          if [ "$TAG" = macos ]; then
+            title="Azeroth Survivors (macOS)"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$title" --notes-file notes.md --target "$SHA"
+            gh release upload "$TAG" dist/*.dmg dist/*.sha256 --clobber
+          elif [ "$TAG" = macos ]; then
+            # Not --latest: the rolling build must not take the download button from a tagged
+            # release the moment main moves again.
+            gh release create "$TAG" dist/*.dmg dist/*.sha256 --target "$SHA" \
+              --title "$title" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/*.dmg dist/*.sha256 --target "$SHA" \
+              --title "$title" --notes-file notes.md --latest
+          fi

@@ -3,6 +3,10 @@
 use benilla_app::BuildId;
 
 fn main() -> benilla_app::AppExit {
+    // A double-clicked .app must not look for game data or write settings inside its own
+    // bundle; a terminal run is not a bundle and this does nothing. See `bundle`. The bin
+    // links this package's lib automatically; it does not redeclare the module.
+    warcraft_survivors::bundle::prepare();
     benilla_app::run_survivors(BuildId {
         version: env!("CARGO_PKG_VERSION"),
         describe: env!("BENILLA_GIT_DESCRIBE"),
